@@ -492,12 +492,32 @@ API docs:
 ```bash
 cd fact-court-ledger
 npm install
+```
+
+Create a `.env.local` file in the `fact-court-ledger` folder.
+
+You can use the provided `.env.example` as a reference:
+
+```env
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+Copy this value into your `.env.local` file:
+
+```env
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+Then run:
+
+```bash
 npm run dev
 ```
 
 Open:
 
 `http://localhost:3000`
+
 
 ---
 
