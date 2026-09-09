@@ -321,14 +321,16 @@ def process_document(
                 (document_id,),
             )
 
-        # ====================================================
-        # 7. LINK NEW CLAIMS
-        # ====================================================
 
-        link_new_claims(
-            session_id,
-            new_claim_ids,
-        )
+        # ====================================================
+        # 7. RELATIONSHIPS ARE LINKED AFTER ALL DOCUMENTS
+        #    IN THE UPLOAD BATCH HAVE BEEN PROCESSED.
+        #
+        #    Do not compare here. When multiple PDFs are uploaded
+        #    together, FastAPI background tasks can otherwise finish
+        #    in an unpredictable order and some documents may see
+        #    only a partial set of claims.
+        # ====================================================
 
     except Exception as error:
 
@@ -351,6 +353,68 @@ def process_document(
         raise
 
 
+def process_documents_batch(
+    jobs: list[tuple[str, str, str]],
+):
+    """
+    Process a group of uploaded PDFs sequentially.
+
+    Each job is:
+        (pdf_path, document_id, session_id)
+
+    Relationships are generated only after every document in the
+    batch has finished claim extraction and storage. This makes
+    multi-PDF analysis deterministic and ensures every verified
+    claim in the session is available to candidate generation.
+    """
+
+    if not jobs:
+        return
+
+    session_id = jobs[0][2]
+
+    # All jobs in one upload request must belong to the same session.
+    for _, _, job_session_id in jobs:
+        if job_session_id != session_id:
+            raise ValueError(
+                "All documents in a processing batch must belong "
+                "to the same session."
+            )
+
+    print(
+        f"[Pipeline] Processing {len(jobs)} document(s) "
+        f"sequentially for session {session_id}"
+    )
+
+    successful = 0
+
+    for pdf_path, document_id, job_session_id in jobs:
+        try:
+            process_document(
+                pdf_path,
+                document_id,
+                job_session_id,
+            )
+            successful += 1
+        except Exception as error:
+            # process_document already marks the document as failed.
+            # Continue processing the remaining PDFs so one bad file
+            # does not prevent the rest of the upload batch.
+            print(
+                f"[Pipeline] Skipping failed document "
+                f"{document_id}: {error}"
+            )
+
+    print(
+        f"[Pipeline] Document batch complete: "
+        f"{successful}/{len(jobs)} succeeded."
+    )
+
+    # One session-wide relationship pass after ALL documents have
+    # been extracted.
+    link_session_claims(session_id)
+
+
 def _run_claim_extraction(
     blocks: list[dict],
 ):
@@ -366,11 +430,14 @@ def _run_claim_extraction(
             blocks
         )
     )
+
+
 def _run_relationship_judgment(llm_pairs):
     """
     Run the async relationship judge from the
     synchronous document-processing pipeline.
     """
+
     import asyncio
 
     return asyncio.run(
@@ -380,136 +447,280 @@ def _run_relationship_judgment(llm_pairs):
     )
 
 
-def link_new_claims(session_id, new_claim_ids):
+def _relationship_exists(
+    conn,
+    claim_a_id: str,
+    claim_b_id: str,
+) -> bool:
+    """
+    Relationships are conceptually undirected for duplicate detection.
+
+    A-B and B-A represent the same pair, even though the stored
+    relationship keeps a source and target claim ID.
+    """
+
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM relationships
+        WHERE
+            (
+                source_claim_id = ?
+                AND target_claim_id = ?
+            )
+            OR
+            (
+                source_claim_id = ?
+                AND target_claim_id = ?
+            )
+        LIMIT 1
+        """,
+        (
+            claim_a_id,
+            claim_b_id,
+            claim_b_id,
+            claim_a_id,
+        ),
+    ).fetchone()
+
+    return row is not None
+
+
+def link_session_claims(session_id: str):
+    """
+    Compare ALL verified claims in a session.
+
+    This replaces the old "new claims vs existing claims" approach.
+    Relationship generation therefore does not depend on which PDF
+    happened to finish first.
+
+    Candidate generation remains conservative, while deterministic
+    rules and Gemini adjudicate the resulting candidate pairs.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Load every verified claim in the session.
+    # ---------------------------------------------------------
+
     with get_conn() as conn:
-        placeholders = ",".join("?" for _ in new_claim_ids)
-
-        new_rows = conn.execute(
-            f"""
-            SELECT *
-            FROM claims
-            WHERE id IN ({placeholders})
-              AND verified = 1
-            """,
-            tuple(new_claim_ids),
-        ).fetchall()
-
-        if not new_rows:
-            return
-
-        existing_rows = conn.execute(
+        rows = conn.execute(
             """
             SELECT claims.*
             FROM claims
             JOIN documents
-              ON documents.id = claims.document_id
+                ON documents.id = claims.document_id
             WHERE documents.session_id = ?
               AND claims.verified = 1
-              AND claims.id NOT IN (
-                  SELECT id
-                  FROM claims
-                  WHERE id IN ({})
-              )
-            """.format(placeholders),
-            (session_id, *new_claim_ids),
+            ORDER BY claims.created_at ASC
+            """,
+            (session_id,),
         ).fetchall()
 
-        if not existing_rows:
-            return
+        claims = [
+            dict(row)
+            for row in rows
+        ]
 
-        new_claims = [dict(row) for row in new_rows]
-        existing_claims = [dict(row) for row in existing_rows]
-
-        # ---------------------------------------------------------
-        # 1. Generate candidate pairs
-        # ---------------------------------------------------------
-
-        pairs = []
-
-        for claim in new_claims:
-            candidates = find_candidates(
-                claim,
-                existing_claims,
-            )
-
-            for other in candidates:
-                pairs.append((claim, other))
-
-        if not pairs:
-            print("No candidate relationships found.")
-            return
-
+    if len(claims) < 2:
         print(
-            f"Candidate relationship pairs: {len(pairs)}"
+            "[Relationships] Fewer than 2 verified claims "
+            "in session; nothing to compare."
         )
+        return
 
-        # ---------------------------------------------------------
-        # 2. Deterministic evaluation first
-        # ---------------------------------------------------------
+    print(
+        f"[Relationships] Session contains "
+        f"{len(claims)} verified claims."
+    )
 
-        deterministic_results, llm_pairs = evaluate_pairs(
-            pairs
-        )
+    # ---------------------------------------------------------
+    # 2. Generate unique candidate pairs across the session.
+    # ---------------------------------------------------------
 
-        print(
-            f"Deterministic relationships: "
-            f"{len(deterministic_results)}"
-        )
+    pairs = []
+    seen_pairs = set()
 
-        print(
-            f"LLM relationships required: "
-            f"{len(llm_pairs)}"
-        )
+    for index, claim in enumerate(claims):
 
-        # ---------------------------------------------------------
-        # 3. Store deterministic results in memory
-        # ---------------------------------------------------------
+        # Only compare with claims after this one.
+        # This prevents A-B and B-A from both becoming candidates.
+        for other in claims[index + 1:]:
 
-        relationships = list(
-            deterministic_results
-        )
-
-        # ---------------------------------------------------------
-        # 4. Batch ambiguous pairs through Gemini
-        # ---------------------------------------------------------
-
-        if llm_pairs:
-            llm_results, total_tokens = (
-                _run_relationship_judgment(
-                    llm_pairs
+            pair_key = tuple(
+                sorted(
+                    (
+                        claim["id"],
+                        other["id"],
+                    )
                 )
             )
 
-            print("[DEBUG] First LLM relationship result:")
-            print(
-                llm_results[0]
-                if llm_results
-                else "NO RESULTS"
+            if pair_key in seen_pairs:
+                continue
+
+            seen_pairs.add(pair_key)
+
+            candidates = find_candidates(
+                claim,
+                [other],
             )
 
-            print(
-                f"LLM relationship judgments: "
-                f"{len(llm_results)}"
+            if candidates:
+                pairs.append(
+                    (
+                        claim,
+                        other,
+                    )
+                )
+
+    print(
+        f"[Relationships] Candidate relationship pairs: "
+        f"{len(pairs)}"
+    )
+
+    if not pairs:
+        print(
+            "[Relationships] No candidate relationships found."
+        )
+        return
+
+    # ---------------------------------------------------------
+    # 3. Remove pairs that already have a stored relationship.
+    # ---------------------------------------------------------
+
+    with get_conn() as conn:
+        new_pairs = []
+
+        for claim_a, claim_b in pairs:
+            if _relationship_exists(
+                conn,
+                claim_a["id"],
+                claim_b["id"],
+            ):
+                continue
+
+            new_pairs.append(
+                (
+                    claim_a,
+                    claim_b,
+                )
             )
 
-            print(
-                f"LLM relationship tokens: "
-                f"{total_tokens}"
+    skipped_existing = len(pairs) - len(new_pairs)
+
+    if skipped_existing:
+        print(
+            f"[Relationships] Skipped "
+            f"{skipped_existing} already-stored pairs."
+        )
+
+    if not new_pairs:
+        print(
+            "[Relationships] All candidate pairs already "
+            "have stored relationships."
+        )
+        return
+
+    # ---------------------------------------------------------
+    # 4. Deterministic evaluation first.
+    # ---------------------------------------------------------
+
+    deterministic_results, llm_pairs = evaluate_pairs(
+        new_pairs
+    )
+
+    print(
+        f"[Relationships] "
+        f"{len(new_pairs)} candidate pairs → "
+        f"{len(deterministic_results)} deterministic, "
+        f"{len(llm_pairs)} require LLM"
+    )
+
+    relationships = list(
+        deterministic_results
+    )
+
+    # ---------------------------------------------------------
+    # 5. Batch ambiguous pairs through Gemini.
+    # ---------------------------------------------------------
+
+    if llm_pairs:
+
+        llm_results, total_tokens = (
+            _run_relationship_judgment(
+                llm_pairs
             )
+        )
 
-            relationships.extend(
-                llm_results
-            )
+        print(
+            "[DEBUG] First LLM relationship result:"
+        )
 
-        # ---------------------------------------------------------
-        # 5. Store all relationships
-        # ---------------------------------------------------------
+        print(
+            llm_results[0]
+            if llm_results
+            else "NO RESULTS"
+        )
 
-        now = datetime.now(
-            timezone.utc
-        ).isoformat()
+        print(
+            f"[Relationships] LLM relationship judgments: "
+            f"{len(llm_results)}"
+        )
+
+        print(
+            f"[Relationships] LLM relationship tokens: "
+            f"{total_tokens}"
+        )
+
+        relationships.extend(
+            llm_results
+        )
+
+    # ---------------------------------------------------------
+    # 6. Store all relationship results.
+    # ---------------------------------------------------------
+
+    if not relationships:
+        print(
+            "[Relationships] No relationship verdicts "
+            "were produced."
+        )
+        return
+
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    stored_count = 0
+
+    with get_conn() as conn:
 
         for relationship in relationships:
+
+            source_id = relationship.get(
+                "source_claim_id"
+            )
+
+            target_id = relationship.get(
+                "target_claim_id"
+            )
+
+            if not source_id or not target_id:
+                print(
+                    "[Relationships] Skipping malformed "
+                    "relationship without claim IDs."
+                )
+                continue
+
+            # Protect against duplicate results from the current
+            # batch as well as relationships already in SQLite.
+            if _relationship_exists(
+                conn,
+                source_id,
+                target_id,
+            ):
+                continue
+
             conn.execute(
                 """
                 INSERT INTO relationships (
@@ -527,34 +738,57 @@ def link_new_claims(session_id, new_claim_ids):
                 """,
                 (
                     str(uuid.uuid4()),
-                    relationship[
-                        "source_claim_id"
-                    ],
-                    relationship[
-                        "target_claim_id"
-                    ],
-                    relationship[
-                        "relationship_type"
-                    ],
-                    relationship[
-                        "reason_code"
-                    ],
-                    relationship[
-                        "explanation"
-                    ],
+                    source_id,
+                    target_id,
+                    relationship.get(
+                        "relationship_type",
+                        "UNCERTAIN",
+                    ),
+                    relationship.get(
+                        "reason_code",
+                        "INSUFFICIENT_CONTEXT",
+                    ),
+                    relationship.get(
+                        "explanation",
+                        "No explanation was returned.",
+                    ),
                     relationship.get(
                         "confidence"
                     ),
                     relationship.get(
                         "decided_by",
-                        "rule",
+                        "rules",
                     ),
                     now,
                 ),
             )
 
+            stored_count += 1
+
         conn.commit()
 
-        print(
-            f"Stored {len(relationships)} relationships."
-        )
+    print(
+        f"[Relationships] Stored {stored_count} "
+        f"new relationships."
+    )
+
+
+# Backwards-compatible wrapper.
+#
+# Existing callers can still invoke link_new_claims(), but the
+# implementation is now session-wide rather than "new vs existing".
+def link_new_claims(
+    session_id: str,
+    new_claim_ids: list[str] | None = None,
+):
+    """
+    Backwards-compatible wrapper for older callers.
+
+    new_claim_ids is intentionally ignored because relationship
+    generation is now performed against all verified claims in
+    the session.
+    """
+
+    link_session_claims(
+        session_id
+    )

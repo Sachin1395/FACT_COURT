@@ -23,7 +23,6 @@ Uses Google Gemini 3.1 Flash-Lite with:
 import asyncio
 import json
 import os
-import re
 import threading
 import time
 from typing import Any
@@ -201,134 +200,99 @@ class AsyncTokenBucketLimiter:
 
 _limiter = AsyncTokenBucketLimiter()
 
-
-# ============================================================
-# PROMPTS
-# ============================================================
-
-# ============================================================
-# PROMPTS
-# ============================================================
-
-# ============================================================
-# PROMPTS
-# ============================================================
-
 EXTRACTION_SYSTEM_PROMPT = """
-You are an expert fact-extractor, specializing in financial and economic documents.
-Your task is to extract high-quality, structured factual claims from provided
-evidence blocks.
+You are an expert data extractor, specializing in financial and economic documents.
+Your task is to extract structured factual claims from provided evidence blocks.
 
 An evidence block contains:
 - block_id
 - page
 - text
 
-Your goal is NOT to extract every number. Your goal is to extract only meaningful,
-complete facts that a user could read in the Fact Court ledger and understand
-without needing the surrounding sentence.
+Crucially, the **evidence_quote** you provide must be verified against the source
+text. Therefore, you must NOT paraphrase, summarize, or alter the wording of the
+source. Your extraction must be a verbatim substring that forms a complete,
+standalone factual proposition.
 
 ==================================================
-WHAT COUNTS AS A VALID CLAIM
+WHAT COUNTS AS A VALID CLAIM (VERBATIM)
 ==================================================
 
-A valid claim MUST be a COMPLETE, STANDALONE FACTUAL PROPOSITION.
+A valid claim must be a COMPLETE, STANDALONE FACTUAL PROPOSITION.
 It must form a coherent sentence when read aloud.
+
+**You must extract a continuous span of text from the source that requires no
+alteration to be understood.**
 
 It should normally contain enough context to answer:
 - WHO or WHAT is being discussed (Subject/Entity)?
 - WHAT happened/changed/was measured (Predicate/Metric)?
-- WHAT is the relevant value, state, or event (Magnitude/Status)?
-- WHEN, if a period or date is stated?
-- WHAT unit or scope applies, if relevant?
+- WHAT is the relevant value, state, or event (Magnitude)?
 
-Good examples:
-- India's international reserves increased from $646.4 billion at end-FY2023/24
-  to $668.3 billion at end-FY2024/25.
-- The current account deficit declined to 0.6 percent of GDP in FY2024/25
-  from 0.7 percent of GDP in the previous year.
+Good examples (must be found verbatim in source):
+- "India's international reserves increased from $646.4 billion at end-FY2023/24
+  to $668.3 billion at end-FY2024/25."
+- "The current account deficit declined to 0.6 percent of GDP in FY2024/25
+  from 0.7 percent of GDP in the previous year."
 
 ==================================================
-REJECT THESE STRUCTURES (CRITICAL)
+STRICT NEGATIVE CONSTRAINTS
 ==================================================
 
-NEVER extract claims that are essentially lists, rows from a table, or
-juxtapositions of values without connecting language.
+DO NOT extract claims if:
 
-Examples you MUST reject:
-- "X | Y | Z"
-- "Tomato | 67% | Rabi"
-- "Crop X Value Y Season Z"
-- "5.9 5.9 5.8 4.5 4.1 4.0" (pure sequences of numbers)
-- "Av. GDP Growth Av. Inflation Rate Av. Policy Rate" (list of headers/labels)
-- "Oct-Nov, Jan-Feb" (list of dates)
-
-==================================================
-DO NOT EXTRACT THESE
-==================================================
-
-NEVER create a claim from:
-- isolated numbers, percentages, or monetary values without context
-- headers, column labels, section headings, or chart labels
-- standalone dates or units without a subject
-- sentence fragments or continuation fragments (e.g., "to $668.3 billion")
-- parenthetical fragments providing supplementary info (e.g., "(from 0.7% of GDP)")
-- duplicate claims
-- facts that cannot be understood without nearby text
-- claims that merely juxtapose a subject and a value (e.g., "Inflation 4%") without
-  a measurable predicate (e.g., "Inflation reached 4%").
-
-If a useful fact is split across adjacent text, COMBINE the relevant text into
-ONE complete claim. Never create separate claims for the pieces.
+1. **You have to change or add words** to make it a complete sentence.
+2. **It is a summary** of the surrounding text rather than a direct quote.
+3. **It is a fragment** (e.g., continuation phrases like "to $668.3 billion" or
+   parenthetical asides like "(from 0.7% of GDP)").
+4. **It is a list or table-row artifact** (e.g., "Tomato | 67% | Rabi").
+5. **It is merely labels and numbers juxtaposed** (e.g., "Inflation 4%"). It must
+   have a verbal predicate (e.g., "Inflation reached 4%").
+6. **It requires pronouns** (it, they, this) whose antecedents are outside the
+   extracted quote.
 
 ==================================================
-QUALITY TEST
+QUALITY TEST & VERIFICATION COMPATIBILITY
 ==================================================
 
-Before returning a claim, silently ask:
-1. Can this claim be understood by itself?
-2. Does it identify its subject and predicate clearly?
-3. Does it state a meaningful fact rather than merely a value or label?
-4. Does it form a coherent sentence when read aloud?
-5. Is it distinct from another extracted claim?
+Before finalizing a claim, simulate the verification step:
+Imagine normalizing both the source text and your extracted quote (removing
+punctuation, lowercasing, normalizing whitespace).
 
-Prefer FEWER high-quality claims over MANY low-quality claims.
+Ask yourself: **Is the text of my claim essentially an exact match to a substring
+of the source text (allowing for minor tokenization differences)?**
+
+If the answer is NO—if you have rephrased the concept or combined non-adjacent
+fragments—Gemini will likely fail the verification step. You must prefer FEWER
+high-quality verbatim claims over MANY summarized claims.
 
 ==================================================
 FACTUALITY RULES
 ==================================================
 
-Extract claims that state:
-- a specific number or percentage
-- a measurable metric
-- a date-bound event
-- a material change
-- another objectively verifiable fact
+Extract claims that state specific numbers, percentages, measurable metrics,
+date-bound events, or material changes. Skip narrative filler, opinions, vague
+statements, and forward-looking statements without a stated figure.
 
-Skip narrative filler, opinions, vague statements, unsupported conclusions, and
-forward-looking statements without a stated figure.
-
-Never invent information. Never infer a period, unit, scope, or definition that is
-not explicitly stated in the source text.
+Never invent information or infer periods/units not explicitly stated in the
+verbatim quote.
 
 ==================================================
-EVIDENCE RULES
+EVIDENCE RULES (CRITICAL)
 ==================================================
 
 evidence_quote MUST be an exact substring of the corresponding evidence block's
-text, copied character-for-character. Do not paraphrase. The quote should be long
-enough to support the complete claim.
+text, copied character-for-character.
+
+Do not paraphrase or alter the wording of the evidence_quote.
 
 block_id MUST identify the evidence block from which the claim was extracted.
 
 Capture period_start, period_end, period_type, scope, basis, and definition
-only when explicitly stated.
-
-If there are no useful standalone factual claims, return [].
+only when explicitly stated *within* the verbatim quote.
 
 Return only JSON matching the supplied response schema.
 """
-
 
 ADJUDICATION_SYSTEM_PROMPT = """
 You are the relationship adjudicator for an evidence-first fact intelligence system.
@@ -475,7 +439,6 @@ Claims regarding the same metric (e.g., "Revenue") but for different periods
 about the same topic. You must return:
 RECONCILES / DIFFERENT_PERIOD.
 """
-
 # ============================================================
 # ERROR HELPERS
 # ============================================================
@@ -596,244 +559,6 @@ async def _async_generate(
 # CLAIM EXTRACTION
 # ============================================================
 
-# These are common signs that the LLM returned only a continuation
-# of a sentence instead of a standalone fact.
-_FRAGMENT_STARTS = {
-    "to",
-    "from",
-    "and",
-    "or",
-    "but",
-    "than",
-    "respectively",
-    "which",
-    "that",
-}
-
-# A few words can still form a valid fact ("GDP grew 7%"), so this is
-# intentionally NOT a large minimum.  The LLM prompt does the semantic work;
-# this filter only removes obviously unstructured extraction artifacts.
-_MIN_EVIDENCE_WORDS = 3
-
-
-def _is_meaningful_claim(claim: ExtractedClaimRaw) -> bool:
-    """
-    Conservative post-filter.
-
-    Keep complete, structured factual propositions.
-    Reject only obvious extraction artifacts such as:
-      - empty subject/predicate/evidence
-      - isolated numbers / values / units
-      - one-word or label-like fragments
-      - sentence continuations
-      - obvious model/parameter strings
-      - table-like numeric fragments
-
-    Do NOT reject a claim merely because it is short or contains numbers.
-    """
-
-    subject = (claim.subject or "").strip()
-    predicate = (claim.predicate or "").strip()
-    quote = (claim.evidence_quote or "").strip()
-
-    # ------------------------------------------------------------
-    # 1. Required claim structure
-    # ------------------------------------------------------------
-
-    if not subject or not predicate or not quote:
-        return False
-
-    words = re.findall(
-        r"\b\w+(?:[-’']\w+)*\b",
-        quote,
-    )
-
-    if not words:
-        return False
-
-    normalized = re.sub(r"\s+", " ", quote.lower()).strip()
-
-    # ------------------------------------------------------------
-    # 2. Reject obvious continuation fragments
-    # ------------------------------------------------------------
-
-    first_word = words[0].lower().strip(".,;:()[]{}")
-
-    
-    
-
-    # ------------------------------------------------------------
-    # 3. Require at least a small amount of natural language
-    # ------------------------------------------------------------
-
-    if len(words) < _MIN_EVIDENCE_WORDS:
-        # Do not keep "7.5%" / "$500 billion" / "Revenue" etc.
-        # A two-word fragment can still be useful only when it has
-        # genuine subject/predicate structure, so reject it here.
-        return False
-
-    alpha_words = re.findall(
-        r"\b[A-Za-z][A-Za-z’'-]*\b",
-        quote,
-    )
-
-    if len(alpha_words) < 2:
-        return False
-
-    # ------------------------------------------------------------
-    # 4. Reject pure numeric / symbolic / value-only evidence
-    # ------------------------------------------------------------
-
-    non_numeric_chars = re.sub(
-        r"[\d\s.,%$₹€£¥:/()\-+]",
-        "",
-        quote,
-    )
-
-    if not non_numeric_chars:
-        return False
-
-    # Values with a unit but no factual proposition:
-    # "33.4 percent", "$668.3 billion", "5.1%", "₹4.7 lakh crore"
-    value_only_pattern = (
-        r"[-+]?[\d.,]+\s*"
-        r"(?:%|percent|per cent|"
-        r"billion|million|thousand|crore|lakh|"
-        r"bn|mn|tn|usd|inr|rupees?|"
-        r"₹|[$€£¥])?"
-    )
-
-    if re.fullmatch(value_only_pattern, normalized, flags=re.IGNORECASE):
-        return False
-
-    # ------------------------------------------------------------
-    # 5. Reject obvious model / parameter labels
-    # ------------------------------------------------------------
-
-    if re.fullmatch(
-        r"(?:arma|arima|sarima|ensemble|model|parameter)"
-        r"\s*(?:\([^)]*\))?\s*"
-        r"[-+]?[\d.,]+(?:\s*[-+/]\s*[\d.,]+)*",
-        normalized,
-        flags=re.IGNORECASE,
-    ):
-        return False
-
-    # ------------------------------------------------------------
-    # 6. Reject table-like unstructured fragments
-    # ------------------------------------------------------------
-
-    # Pipes/tabs with several numeric cells are usually copied table rows,
-    # not standalone factual propositions.
-    separators = quote.count("|") + quote.count("\t")
-
-    numeric_tokens = re.findall(
-        r"(?<![A-Za-z])[-+]?\d+(?:[.,]\d+)*(?:%|[A-Za-z]+)?",
-        quote,
-    )
-
-    if separators >= 1 and len(numeric_tokens) >= 3:
-        return False
-
-    # ------------------------------------------------------------
-    # 7. Reject heading/label-like evidence generically
-    # ------------------------------------------------------------
-
-    # A short phrase with no obvious factual predicate is generally a label.
-    # We deliberately avoid a hard-coded list of financial labels so that
-    # legitimate facts from other documents are not discarded.
-    if len(words) <= 4:
-        predicate_words = re.findall(
-            r"\b[A-Za-z][A-Za-z’'-]*\b",
-            predicate.lower(),
-        )
-
-        predicate_text = " ".join(predicate_words)
-
-        # Common non-predicate extraction artifacts.
-        label_only_words = {
-            "total",
-            "growth",
-            "rate",
-            "ratio",
-            "revenue",
-            "investment",
-            "investments",
-            "exports",
-            "imports",
-            "inflation",
-            "fiscal",
-            "debt",
-            "deficit",
-            "reserves",
-            "liquidity",
-            "capital",
-            "employment",
-            "unemployment",
-            "production",
-            "consumption",
-            "sales",
-            "assets",
-            "liabilities",
-        }
-
-        normalized_alpha = {
-            word.lower()
-            for word in re.findall(
-                r"\b[A-Za-z][A-Za-z’'-]*\b",
-                quote,
-            )
-        }
-
-        if normalized_alpha and normalized_alpha.issubset(label_only_words):
-            return False
-
-        # If the LLM supplied no meaningful predicate at all, treat a
-        # very short evidence phrase as an unstructured label.
-        if not predicate_text:
-            return False
-
-    # ------------------------------------------------------------
-    # 8. Final structural sanity check
-    # ------------------------------------------------------------
-
-    predicate_words = re.findall(
-        r"\b[A-Za-z][A-Za-z’'-]*\b",
-        predicate.lower(),
-    )
-
-    if not predicate_words:
-        return False
-
-    return True
-
-
-def _filter_extracted_claims(
-    claims: list[ExtractedClaimRaw],
-) -> list[ExtractedClaimRaw]:
-    """
-    Apply the conservative structural filter to LLM output.
-
-    This function intentionally does not perform aggressive semantic
-    filtering. Gemini is responsible for deciding whether something is
-    actually a factual claim; this layer only removes clearly malformed
-    or unstructured results.
-    """
-
-    filtered: list[ExtractedClaimRaw] = []
-
-    for claim in claims:
-        if _is_meaningful_claim(claim):
-            filtered.append(claim)
-        else:
-            print(
-                "[Gemini] Low-quality claim skipped: "
-                f"'{(claim.evidence_quote or '').strip()}'"
-            )
-
-    return filtered
-
-
 async def _extract_claims_async(
     block_text: str,
 ) -> tuple[list[ExtractedClaimRaw], int]:
@@ -863,7 +588,6 @@ async def _extract_claims_async(
                     f"{error}"
                 )
 
-        claims = _filter_extracted_claims(claims)
         return claims, tokens
 
     except Exception as error:
@@ -996,7 +720,6 @@ async def _extract_claims_batch_async(
                     f"{error}"
                 )
 
-        claims = _filter_extracted_claims(claims)
         return claims, tokens
 
     except Exception as error:

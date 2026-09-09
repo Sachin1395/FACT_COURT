@@ -1,157 +1,114 @@
-"""
-Candidate generation for cross-document claim matching.
-
-Candidate generation answers only:
-
-    "Could these two claims describe the same underlying
-     metric or fact?"
-
-It does NOT decide:
-    CORROBORATES
-    CONTRADICTS
-    RECONCILES
-    UNCERTAIN
-
-Those decisions are handled later by the deterministic
-relationship rules and LLM adjudication.
-
-Design goals:
-- Avoid comparing unrelated metrics.
-- Allow different reporting periods.
-- Allow different units when the underlying metric is the same.
-- Allow different wording for the same metric.
-- Avoid generic one-word subjects acting as wildcards.
-- Use definitions/context as an additional filter.
-"""
-
 import re
 from difflib import SequenceMatcher
 
 
-# ============================================================
-# NORMALIZATION
-# ============================================================
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
 
+# Maximum number of candidate pairs sent to relationship adjudication.
+MAX_CANDIDATES = 150
+
+# Minimum score required for a pair to be considered plausible at all.
+MIN_CANDIDATE_SCORE = 18.0
+
+
+# ---------------------------------------------------------------------------
+# TEXT NORMALIZATION
+# ---------------------------------------------------------------------------
+
+def _normalize_text(value):
+    if not value:
+        return ""
+
+    value = str(value).lower().strip()
+
+    # Preserve numbers, letters, percentage signs, and spaces.
+    value = re.sub(r"[^a-z0-9% ]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value
+
+
+def _tokens(value):
+    return set(_normalize_text(value).split())
+
+
+# Common words that carry very little relationship signal.
 _STOPWORDS = {
     "the",
     "a",
     "an",
     "of",
-    "for",
+    "and",
+    "or",
     "to",
     "in",
     "on",
-    "at",
-    "by",
+    "for",
     "from",
-    "and",
-    "or",
-    "as",
+    "by",
     "with",
-    "during",
+    "at",
+    "as",
+    "is",
+    "was",
+    "were",
+    "are",
+    "be",
+    "been",
+    "being",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "their",
+    "there",
+    "than",
+    "then",
+    "also",
+    "both",
     "over",
+    "under",
+    "during",
+    "between",
+    "through",
     "per",
+    "into",
+    "which",
+    "who",
+    "whose",
+    "reported",
 }
 
 
-def _normalize_text(value) -> str:
-    """
-    Normalize text for semantic/token comparison.
-
-    This is deliberately conservative:
-    we normalize formatting but do not aggressively
-    rewrite the meaning of the claim.
-    """
-
-    if value is None:
-        return ""
-
-    text = str(value).lower()
-
-    # Unicode punctuation normalization
-    text = text.replace("–", "-")
-    text = text.replace("—", "-")
-    text = text.replace("−", "-")
-    text = text.replace("’", "'")
-    text = text.replace("“", '"')
-    text = text.replace("”", '"')
-
-    # Common separators
-    text = text.replace("_", " ")
-    text = text.replace("/", " ")
-    text = text.replace("-", " ")
-
-    # Remove punctuation
-    text = re.sub(r"[^a-z0-9.% ]+", " ", text)
-
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def _tokens(value) -> set[str]:
-    """
-    Return normalized content tokens.
-
-    Stopwords are removed so phrases such as:
-
-        "revenue from operations"
-        "revenue of operations"
-
-    are easier to compare.
-    """
-
-    text = _normalize_text(value)
-
-    if not text:
-        return set()
-
+def _meaningful_tokens(value):
     return {
         token
-        for token in text.split()
-        if token not in _STOPWORDS
+        for token in _tokens(value)
+        if token not in _STOPWORDS and len(token) > 1
     }
 
 
-# ============================================================
-# SIMILARITY
-# ============================================================
+# ---------------------------------------------------------------------------
+# BASIC SIMILARITY
+# ---------------------------------------------------------------------------
 
-def _similar(a, b, threshold=0.75) -> bool:
-    """
-    Character-level similarity.
-
-    Useful when two labels differ slightly, e.g.
-
-        "revenue from operations"
-        "revenue from operation"
-    """
-
+def _sequence_similarity(a, b):
     a = _normalize_text(a)
     b = _normalize_text(b)
 
     if not a or not b:
-        return False
+        return 0.0
 
-    return SequenceMatcher(None, a, b).ratio() >= threshold
+    return SequenceMatcher(None, a, b).ratio()
 
 
-def _token_overlap(a, b) -> float:
-    """
-    Jaccard token similarity.
-
-        intersection / union
-
-    IMPORTANT:
-    Do NOT use intersection / min(len(a), len(b)).
-
-    The latter allows a generic one-token subject such as
-    "cash" or "revenue" to behave like a wildcard.
-    """
-
-    a_tokens = _tokens(a)
-    b_tokens = _tokens(b)
+def _token_overlap(a, b):
+    a_tokens = _meaningful_tokens(a)
+    b_tokens = _meaningful_tokens(b)
 
     if not a_tokens or not b_tokens:
         return 0.0
@@ -164,509 +121,830 @@ def _token_overlap(a, b) -> float:
     return len(a_tokens & b_tokens) / len(union)
 
 
-# ============================================================
-# CANONICALIZATION
-# ============================================================
-
-def _canonicalize_predicate(value) -> str:
+def _containment_overlap(a, b):
     """
-    Normalize predicate wording.
+    Measures whether the smaller token set is substantially contained
+    inside the larger one.
 
-    Keep this lightweight. The LLM should ultimately determine
-    semantic equivalence for ambiguous cases.
-    """
+    Examples:
 
-    text = _normalize_text(value)
+        "Indian exports"
+        "exports"
 
-    replacements = {
-        "grew": "growth",
-        "growth rate": "growth",
-        "increased": "increase",
-        "increasing": "increase",
-        "decreased": "decrease",
-        "decreasing": "decrease",
-    }
+    or:
 
-    for source, target in replacements.items():
-        text = text.replace(source, target)
-
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _canonicalize_subject(value) -> str:
-    """
-    Normalize subject wording without trying to infer meaning.
-    """
-
-    return re.sub(
-        r"\s+",
-        " ",
-        _normalize_text(value),
-    ).strip()
-
-
-# ============================================================
-# SUBJECT MATCHING
-# ============================================================
-
-def _same_subject(a, b, threshold=0.75) -> bool:
-    """
-    Determine whether two subjects are plausible matches.
-
-    For normal multi-token subjects:
-        - character similarity OR
-        - Jaccard token overlap
-
-    For one-token subjects:
-        - require direct similarity
-
-    This prevents generic terms such as:
-        "cash"
+        "total revenue"
         "revenue"
-        "value"
-
-    from becoming wildcards.
     """
 
-    canonical_a = _canonicalize_subject(a)
-    canonical_b = _canonicalize_subject(b)
+    a_tokens = _meaningful_tokens(a)
+    b_tokens = _meaningful_tokens(b)
 
-    if not canonical_a or not canonical_b:
+    if not a_tokens or not b_tokens:
+        return 0.0
+
+    smaller = min(len(a_tokens), len(b_tokens))
+
+    if smaller == 0:
+        return 0.0
+
+    return len(a_tokens & b_tokens) / smaller
+
+
+# ---------------------------------------------------------------------------
+# SUBJECT / ENTITY SIMILARITY
+# ---------------------------------------------------------------------------
+
+_METRIC_SYNONYMS = {
+    "sales": "revenue",
+    "net sales": "revenue",
+    "total sales": "revenue",
+    "total revenue": "revenue",
+    "revenues": "revenue",
+    "turnover": "revenue",
+
+    "earnings": "profit",
+    "net earnings": "profit",
+    "net income": "profit",
+    "net profit": "profit",
+
+    "operating earnings": "operating profit",
+    "operating income": "operating profit",
+
+    "cash and cash equivalents": "cash balance",
+    "cash equivalents": "cash balance",
+
+    "imports": "imports",
+    "import value": "imports",
+    "import volume": "imports",
+
+    "exports": "exports",
+    "export value": "exports",
+    "export volume": "exports",
+
+    "tariff rate": "tariff",
+    "tariff rates": "tariff",
+    "customs duty": "tariff",
+    "customs duties": "tariff",
+
+    "inflation rate": "inflation",
+    "consumer price inflation": "inflation",
+
+    "employment rate": "employment",
+    "unemployment rate": "unemployment",
+}
+
+
+def _canonical_metric(value):
+    normalized = _normalize_text(value)
+
+    if normalized in _METRIC_SYNONYMS:
+        return _METRIC_SYNONYMS[normalized]
+
+    return normalized
+
+
+def _same_subject(a, b, threshold=0.75):
+    """
+    Determine whether two subjects are probably the same entity/topic.
+
+    This is intentionally softer than the original implementation because
+    real documents frequently phrase the same subject differently.
+    """
+
+    normalized_a = _normalize_text(a)
+    normalized_b = _normalize_text(b)
+
+    if not normalized_a or not normalized_b:
         return False
 
-    a_tokens = _tokens(canonical_a)
-    b_tokens = _tokens(canonical_b)
-
-    # Short/generic subjects need stricter matching.
-    if min(len(a_tokens), len(b_tokens)) < 2:
-        return _similar(
-            canonical_a,
-            canonical_b,
-            threshold,
-        )
-
-    return (
-        _similar(
-            canonical_a,
-            canonical_b,
-            threshold,
-        )
-        or
-        _token_overlap(
-            canonical_a,
-            canonical_b,
-        ) >= 0.60
-    )
-
-
-# ============================================================
-# PREDICATE MATCHING
-# ============================================================
-
-def _same_predicate(a, b, threshold=0.75) -> bool:
-    """
-    Determine whether two predicates are plausibly equivalent.
-
-    IMPORTANT:
-    Missing predicates are NOT automatically considered
-    compatible.
-
-    Treating missing information as True creates many false
-    candidate pairs.
-    """
-
-    canonical_a = _canonicalize_predicate(a)
-    canonical_b = _canonicalize_predicate(b)
-
-    if not canonical_a or not canonical_b:
-        return False
-
-    a_tokens = _tokens(canonical_a)
-    b_tokens = _tokens(canonical_b)
-
-    if min(len(a_tokens), len(b_tokens)) < 2:
-        return _similar(
-            canonical_a,
-            canonical_b,
-            threshold,
-        )
-
-    return (
-        _similar(
-            canonical_a,
-            canonical_b,
-            threshold,
-        )
-        or
-        _token_overlap(
-            canonical_a,
-            canonical_b,
-        ) >= 0.60
-    )
-
-
-# ============================================================
-# VALUE / UNIT COMPATIBILITY
-# ============================================================
-
-def _normalize_unit(unit) -> str:
-    """
-    Normalize common unit spellings.
-    """
-
-    if unit is None:
-        return ""
-
-    text = _normalize_text(unit)
-
-    aliases = {
-        "percent": "%",
-        "percentage": "%",
-        "pct": "%",
-        "crore": "cr",
-        "crores": "cr",
-        "rs": "inr",
-        "₹": "inr",
-        "rupees": "inr",
-        "million": "mn",
-        "millions": "mn",
-        "billion": "bn",
-        "billions": "bn",
-    }
-
-    return aliases.get(text, text)
-
-
-def _value_type_compatible(a, b) -> bool:
-    """
-    Reject clearly incompatible value types.
-
-    Missing value types are allowed because extraction may not
-    always provide them.
-    """
-
-    a_type = _normalize_text(a.get("value_type"))
-    b_type = _normalize_text(b.get("value_type"))
-
-    if not a_type or not b_type:
+    if normalized_a == normalized_b:
         return True
 
-    return a_type == b_type
+    if _sequence_similarity(normalized_a, normalized_b) >= threshold:
+        return True
+
+    if _token_overlap(normalized_a, normalized_b) >= 0.40:
+        return True
+
+    if _containment_overlap(normalized_a, normalized_b) >= 0.60:
+        return True
+
+    return False
 
 
-def _unit_compatible(a, b) -> bool:
+def _subject_similarity(a, b):
+    normalized_a = _normalize_text(a)
+    normalized_b = _normalize_text(b)
+
+    if not normalized_a or not normalized_b:
+        return 0.0
+
+    if normalized_a == normalized_b:
+        return 1.0
+
+    return max(
+        _sequence_similarity(normalized_a, normalized_b),
+        _token_overlap(normalized_a, normalized_b),
+        _containment_overlap(normalized_a, normalized_b),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PREDICATE SIMILARITY
+# ---------------------------------------------------------------------------
+
+def _canonical_predicate(value):
+    normalized = _normalize_text(value)
+
+    if normalized in _METRIC_SYNONYMS:
+        return _METRIC_SYNONYMS[normalized]
+
+    return normalized
+
+
+def _same_predicate(a, b, threshold=0.75):
+    canonical_a = _canonical_predicate(a)
+    canonical_b = _canonical_predicate(b)
+
+    if not canonical_a or not canonical_b:
+        return False
+
+    if canonical_a == canonical_b:
+        return True
+
+    if _sequence_similarity(canonical_a, canonical_b) >= threshold:
+        return True
+
+    if _token_overlap(canonical_a, canonical_b) >= 0.40:
+        return True
+
+    if _containment_overlap(canonical_a, canonical_b) >= 0.60:
+        return True
+
+    return False
+
+
+def _predicate_similarity(a, b):
+    canonical_a = _canonical_predicate(a)
+    canonical_b = _canonical_predicate(b)
+
+    if not canonical_a or not canonical_b:
+        return 0.0
+
+    if canonical_a == canonical_b:
+        return 1.0
+
+    return max(
+        _sequence_similarity(canonical_a, canonical_b),
+        _token_overlap(canonical_a, canonical_b),
+        _containment_overlap(canonical_a, canonical_b),
+    )
+
+
+# ---------------------------------------------------------------------------
+# UNITS / VALUE TYPES
+# ---------------------------------------------------------------------------
+
+_UNIT_ALIASES = {
+    "₹": "inr",
+    "rs": "inr",
+    "rupees": "inr",
+    "inr": "inr",
+
+    "crore": "crore",
+    "crores": "crore",
+    "cr": "crore",
+
+    "lakh": "lakh",
+    "lakhs": "lakh",
+
+    "million": "million",
+    "mn": "million",
+
+    "billion": "billion",
+    "bn": "billion",
+
+    "%": "percent",
+    "percent": "percent",
+    "percentage": "percent",
+
+    "count": "count",
+    "number": "count",
+    "times": "time",
+}
+
+
+def _unit_tokens(unit):
+    normalized = _normalize_text(unit)
+
+    return {
+        _UNIT_ALIASES.get(token, token)
+        for token in normalized.split()
+    }
+
+
+def _unit_family(unit):
+    tokens = _unit_tokens(unit)
+
+    if not tokens:
+        return None
+
+    if "percent" in tokens:
+        return "percent"
+
+    if "time" in tokens:
+        return "time"
+
+    if "count" in tokens:
+        return "count"
+
+    currency_scale = {
+        "crore",
+        "lakh",
+        "million",
+        "billion",
+    }
+
+    if tokens & currency_scale:
+        return "currency"
+
+    if "inr" in tokens:
+        return "currency"
+
+    return None
+
+
+def _same_unit(a, b):
     """
-    Units are allowed to differ.
+    Units are a scoring signal rather than a hard candidate filter.
 
-    Example:
-
-        ₹1,266 million
-        ₹126.6 crore
-
-    can describe the same underlying fact.
-
-    We therefore do NOT reject a pair simply because units
-    differ.
-
-    We only reject obviously incompatible qualitative units.
+    We don't want to eliminate potentially useful relationships simply
+    because the claims use different units.
     """
 
-    unit_a = _normalize_unit(a.get("unit"))
-    unit_b = _normalize_unit(b.get("unit"))
+    unit_a = a.get("unit")
+    unit_b = b.get("unit")
 
     if not unit_a or not unit_b:
         return True
 
-    if unit_a == unit_b:
+    normalized_a = _unit_tokens(unit_a)
+    normalized_b = _unit_tokens(unit_b)
+
+    if normalized_a == normalized_b:
         return True
 
-    # Numeric monetary/scaled units can be normalized later.
-    numeric_units = {
-        "inr",
-        "cr",
-        "mn",
-        "bn",
-        "million",
-        "billion",
-        "thousand",
-        "lakh",
-    }
+    family_a = _unit_family(unit_a)
+    family_b = _unit_family(unit_b)
 
-    if unit_a in numeric_units and unit_b in numeric_units:
+    # Unknown dimensions should not block candidate generation.
+    if family_a is None or family_b is None:
         return True
 
-    # Percent-like units
-    percentage_units = {
-        "%",
-        "percent",
-        "percentage",
-        "pct",
-    }
+    return family_a == family_b
 
-    if unit_a in percentage_units and unit_b in percentage_units:
+
+def _same_value_type(a, b):
+    type_a = _normalize_text(a.get("value_type"))
+    type_b = _normalize_text(b.get("value_type"))
+
+    if not type_a or not type_b:
         return True
 
-    # Multiples such as x
-    if unit_a == "x" and unit_b == "x":
-        return True
-
-    # If either unit is unknown, allow the LLM to decide.
-    return True
+    return type_a == type_b
 
 
-# ============================================================
-# PERIOD COMPATIBILITY
-# ============================================================
+# ---------------------------------------------------------------------------
+# CONTEXT SIMILARITY
+# ---------------------------------------------------------------------------
 
-def _period_compatible(a, b) -> bool:
+def _field_similarity(a, b, field):
+    value_a = a.get(field, "")
+    value_b = b.get(field, "")
+
+    if not value_a or not value_b:
+        return 0.0
+
+    return max(
+        _sequence_similarity(value_a, value_b),
+        _token_overlap(value_a, value_b),
+        _containment_overlap(value_a, value_b),
+    )
+
+
+def _definition_similarity(a, b):
+    return _field_similarity(a, b, "definition")
+
+
+def _basis_similarity(a, b):
+    return _field_similarity(a, b, "basis")
+
+
+def _scope_similarity(a, b):
+    return _field_similarity(a, b, "scope")
+
+
+# ---------------------------------------------------------------------------
+# PERIOD SIMILARITY
+# ---------------------------------------------------------------------------
+
+def _period_similarity(a, b):
     """
-    Period differences are NOT a reason to reject candidates.
+    Period is contextual information, not a hard filter.
+
+    Same period:
+        strong candidate signal.
+
+    Different period:
+        still potentially useful because the relationship adjudicator
+        can classify it as RECONCILES / DIFFERENT_PERIOD.
+    """
+
+    fields = [
+        "period_start",
+        "period_end",
+        "period_type",
+    ]
+
+    available_a = [
+        str(a.get(field))
+        for field in fields
+        if a.get(field)
+    ]
+
+    available_b = [
+        str(b.get(field))
+        for field in fields
+        if b.get(field)
+    ]
+
+    if not available_a or not available_b:
+        return 0.0
+
+    text_a = " ".join(available_a)
+    text_b = " ".join(available_b)
+
+    if text_a == text_b:
+        return 1.0
+
+    return max(
+        _sequence_similarity(text_a, text_b),
+        _token_overlap(text_a, text_b),
+        _containment_overlap(text_a, text_b),
+    )
+
+
+# ---------------------------------------------------------------------------
+# RELATIONSHIP SIGNALS
+# ---------------------------------------------------------------------------
+
+_RELATION_CUES = {
+    "because",
+    "due",
+    "caused",
+    "cause",
+    "causing",
+    "led",
+    "leads",
+    "result",
+    "resulted",
+    "resulting",
+    "therefore",
+    "following",
+    "after",
+    "before",
+    "while",
+    "whereas",
+    "however",
+    "despite",
+
+    "increase",
+    "increased",
+    "increasing",
+    "decrease",
+    "decreased",
+    "decline",
+    "declined",
+    "fall",
+    "fell",
+    "rose",
+    "grew",
+    "growth",
+    "reduced",
+    "reduction",
+
+    "higher",
+    "lower",
+    "change",
+    "changed",
+    "impact",
+    "effect",
+    "affected",
+    "contributed",
+    "contribution",
+    "associated",
+    "correlated",
+    "compared",
+    "versus",
+}
+
+
+def _claim_text(claim):
+    parts = [
+        claim.get("subject", ""),
+        claim.get("predicate", ""),
+        claim.get("definition", ""),
+        claim.get("basis", ""),
+        claim.get("scope", ""),
+    ]
+
+    return " ".join(
+        str(part)
+        for part in parts
+        if part
+    )
+
+
+def _relation_cue_overlap(a, b):
+    tokens_a = _meaningful_tokens(_claim_text(a))
+    tokens_b = _meaningful_tokens(_claim_text(b))
+
+    cues_a = tokens_a & _RELATION_CUES
+    cues_b = tokens_b & _RELATION_CUES
+
+    return len(cues_a & cues_b)
+
+
+def _shared_context_tokens(a, b):
+    """
+    Find meaningful tokens shared across the complete claim context.
+
+    This allows potentially related claims with different predicates
+    to become candidates.
 
     Example:
 
-        FY2024 revenue = ₹8,142 crore
-        Q4 FY2024 revenue = ₹2,076 crore
+        "Tariff rates declined"
 
-    These may concern the same metric but different scopes.
+        "Imports increased"
 
-    The relationship layer will later classify such a pair as
-    RECONCILES / DIFFERENT_PERIOD when appropriate.
+    The subjects and predicates differ, but the claims may share
+    meaningful contextual terms such as India, trade, policy, etc.
     """
 
-    return True
+    tokens_a = _meaningful_tokens(_claim_text(a))
+    tokens_b = _meaningful_tokens(_claim_text(b))
+
+    return tokens_a & tokens_b
 
 
-# ============================================================
-# DEFINITION COMPATIBILITY
-# ============================================================
+# ---------------------------------------------------------------------------
+# PAIR SCORING
+# ---------------------------------------------------------------------------
 
-def _definition_compatible(a, b) -> bool:
+def _candidate_score(
+    claim,
+    other,
+    subject_threshold=0.75,
+    predicate_threshold=0.75,
+):
+    subject_a = claim.get("subject", "")
+    subject_b = other.get("subject", "")
+
+    predicate_a = claim.get("predicate", "")
+    predicate_b = other.get("predicate", "")
+
+    subject_score = _subject_similarity(
+        subject_a,
+        subject_b,
+    )
+
+    predicate_score = _predicate_similarity(
+        predicate_a,
+        predicate_b,
+    )
+
+    definition_score = _definition_similarity(
+        claim,
+        other,
+    )
+
+    basis_score = _basis_similarity(
+        claim,
+        other,
+    )
+
+    scope_score = _scope_similarity(
+        claim,
+        other,
+    )
+
+    period_score = _period_similarity(
+        claim,
+        other,
+    )
+
+    shared_tokens = _shared_context_tokens(
+        claim,
+        other,
+    )
+
+    relation_cues = _relation_cue_overlap(
+        claim,
+        other,
+    )
+
+    same_subject = _same_subject(
+        subject_a,
+        subject_b,
+        subject_threshold,
+    )
+
+    same_predicate = _same_predicate(
+        predicate_a,
+        predicate_b,
+        predicate_threshold,
+    )
+
+    same_unit = _same_unit(
+        claim,
+        other,
+    )
+
+    same_value_type = _same_value_type(
+        claim,
+        other,
+    )
+
+    # ------------------------------------------------------------------
+    # STRONGEST CASE
+    # ------------------------------------------------------------------
+    #
+    # Same subject + same predicate is highly likely to be a meaningful
+    # comparison. But don't blindly assign 100 because we want ranking
+    # diversity.
+    # ------------------------------------------------------------------
+
+    if same_subject and same_predicate:
+        score = 70.0
+
+        score += definition_score * 12.0
+        score += basis_score * 5.0
+        score += scope_score * 5.0
+        score += period_score * 8.0
+
+        if shared_tokens:
+            score += min(len(shared_tokens), 5) * 1.5
+
+        if same_unit:
+            score += 3.0
+
+        if same_value_type:
+            score += 2.0
+
+        return score, "same_subject_and_predicate"
+
+    # ------------------------------------------------------------------
+    # SAME SUBJECT / DIFFERENT PREDICATE
+    # ------------------------------------------------------------------
+    #
+    # Useful for related metrics.
+    #
+    # Example:
+    #
+    #     tariff rate decreased
+    #     imports increased
+    #
+    # The same subject/context can still make this worth adjudicating.
+    # ------------------------------------------------------------------
+
+    if same_subject:
+        score = 45.0
+
+        score += predicate_score * 12.0
+        score += definition_score * 12.0
+        score += basis_score * 5.0
+        score += scope_score * 5.0
+        score += period_score * 6.0
+
+        if shared_tokens:
+            score += min(len(shared_tokens), 5) * 2.0
+
+        if relation_cues:
+            score += min(relation_cues, 3) * 3.0
+
+        if same_unit:
+            score += 2.0
+
+        if same_value_type:
+            score += 1.0
+
+        return score, "same_subject_related_predicate"
+
+    # ------------------------------------------------------------------
+    # DIFFERENT SUBJECT / SHARED CONTEXT
+    # ------------------------------------------------------------------
+    #
+    # More conservative because unrelated claims can share generic
+    # contextual words.
+    # ------------------------------------------------------------------
+
+    shared_token_count = len(shared_tokens)
+
+    score = 0.0
+
+    if shared_token_count >= 4:
+        score += 28.0
+    elif shared_token_count == 3:
+        score += 23.0
+    elif shared_token_count == 2:
+        score += 16.0
+    elif shared_token_count == 1:
+        score += 5.0
+
+    score += subject_score * 12.0
+    score += predicate_score * 8.0
+    score += definition_score * 18.0
+    score += basis_score * 5.0
+    score += scope_score * 5.0
+    score += period_score * 5.0
+
+    if relation_cues:
+        score += min(relation_cues, 3) * 4.0
+
+    if same_unit:
+        score += 2.0
+
+    if same_value_type:
+        score += 1.0
+
+    return score, "shared_context"
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC PAIR SCORING API
+# ---------------------------------------------------------------------------
+
+def score_candidate_pair(
+    claim,
+    other,
+    subject_threshold=0.75,
+    predicate_threshold=0.75,
+):
     """
-    Use definitions as a conservative semantic filter.
+    Score a single pair.
 
-    If neither claim has a definition:
-        allow.
+    Returns:
 
-    If only one has a definition:
-        allow.
+        (score, reason)
 
-    If both have definitions:
-        reject only when they are strongly different.
-
-    This is intentionally conservative because different
-    wording does not necessarily mean different definitions.
+    A score <= 0 means the pair should not be considered.
     """
 
-    definition_a = a.get("definition")
-    definition_b = b.get("definition")
+    # Never compare a claim with itself.
+    if claim.get("id") == other.get("id"):
+        return 0.0, "same_claim"
 
-    if not definition_a or not definition_b:
-        return True
+    # Candidate generation is cross-document only.
+    document_a = claim.get("document_id")
+    document_b = other.get("document_id")
 
-    a_text = _normalize_text(definition_a)
-    b_text = _normalize_text(definition_b)
+    if (
+        document_a
+        and document_b
+        and document_a == document_b
+    ):
+        return 0.0, "same_document"
 
-    if not a_text or not b_text:
-        return True
+    score, reason = _candidate_score(
+        claim,
+        other,
+        subject_threshold,
+        predicate_threshold,
+    )
 
-    similarity = SequenceMatcher(
-        None,
-        a_text,
-        b_text,
-    ).ratio()
+    if score < MIN_CANDIDATE_SCORE:
+        return 0.0, "below_threshold"
 
-    # Very different definitions are unlikely to be
-    # the same metric.
-    if similarity < 0.35:
-        return False
-
-    return True
+    return score, reason
 
 
-# ============================================================
-# MAIN CANDIDATE TEST
-# ============================================================
+# ---------------------------------------------------------------------------
+# GLOBAL CANDIDATE RANKING
+# ---------------------------------------------------------------------------
 
-def _is_candidate(claim_a, claim_b) -> bool:
+def rank_candidates(
+    claims,
+    max_candidates=MAX_CANDIDATES,
+    subject_threshold=0.75,
+    predicate_threshold=0.75,
+):
     """
-    Decide whether two claims should be sent downstream
-    for relationship evaluation.
+    Score all cross-document claim pairs and keep only the strongest ones.
+
+    This is the main candidate-generation API used by the relationship
+    pipeline.
+
+    Example:
+
+        176 claims
+            ↓
+        possible cross-document pairs
+            ↓
+        scoring
+            ↓
+        top 150
+            ↓
+        Gemini adjudication
     """
 
-    # --------------------------------------------------------
-    # Subject
-    # --------------------------------------------------------
+    scored = []
 
-    if not _same_subject(
-        claim_a.get("subject", ""),
-        claim_b.get("subject", ""),
-    ):
-        return False
+    for i, claim_a in enumerate(claims):
 
-    # --------------------------------------------------------
-    # Predicate
-    # --------------------------------------------------------
+        for claim_b in claims[i + 1:]:
 
-    if not _same_predicate(
-        claim_a.get("predicate", ""),
-        claim_b.get("predicate", ""),
-    ):
-        return False
+            score, reason = score_candidate_pair(
+                claim_a,
+                claim_b,
+                subject_threshold,
+                predicate_threshold,
+            )
 
-    # --------------------------------------------------------
-    # Value type
-    # --------------------------------------------------------
+            if score <= 0:
+                continue
 
-    if not _value_type_compatible(
-        claim_a,
-        claim_b,
-    ):
-        return False
+            scored.append(
+                (
+                    claim_a,
+                    claim_b,
+                    score,
+                    reason,
+                )
+            )
 
-    # --------------------------------------------------------
-    # Unit
-    # --------------------------------------------------------
+    # Strongest pairs first.
+    scored.sort(
+        key=lambda item: item[2],
+        reverse=True,
+    )
 
-    if not _unit_compatible(
-        claim_a,
-        claim_b,
-    ):
-        return False
+    selected = scored[:max_candidates]
 
-    # --------------------------------------------------------
-    # Period
-    # --------------------------------------------------------
+    print(
+        "[Candidates] "
+        f"{len(scored)} plausible pairs → "
+        f"top {len(selected)} selected"
+    )
 
-    if not _period_compatible(
-        claim_a,
-        claim_b,
-    ):
-        return False
+    if selected:
+        print(
+            "[Candidates] "
+            f"score range: "
+            f"{selected[-1][2]:.1f} - "
+            f"{selected[0][2]:.1f}"
+        )
 
-    # --------------------------------------------------------
-    # Definition
-    # --------------------------------------------------------
-
-    if not _definition_compatible(
-        claim_a,
-        claim_b,
-    ):
-        return False
-
-    return True
+    return selected
 
 
-# ============================================================
-# PUBLIC API
-# ============================================================
+# ---------------------------------------------------------------------------
+# BACKWARD-COMPATIBLE API
+# ---------------------------------------------------------------------------
 
 def find_candidates(
-    claim: dict,
-    existing_claims: list[dict],
-) -> list[dict]:
+    claim,
+    other_claims,
+    subject_threshold=0.75,
+    predicate_threshold=0.75,
+):
     """
-    Find existing claims that could describe the same
-    underlying metric/fact.
+    Backwards-compatible API.
 
-    Candidate generation is deliberately broader than
-    deterministic relationship evaluation.
+    This remains available for any existing code that expects:
 
-    The output is a list of existing claim dictionaries.
+        find_candidates(claim, other_claims)
+
+    For the session-wide relationship pipeline, prefer:
+
+        rank_candidates(claims)
     """
 
     candidates = []
 
-    for existing in existing_claims:
+    for other in other_claims:
 
-        # Never compare a claim with itself.
-        if claim.get("id") == existing.get("id"):
+        score, _ = score_candidate_pair(
+            claim,
+            other,
+            subject_threshold,
+            predicate_threshold,
+        )
+
+        if score <= 0:
             continue
 
-        if _is_candidate(
-            claim,
-            existing,
-        ):
-            candidates.append(existing)
+        candidates.append(other)
 
     return candidates
-
-
-# ============================================================
-# OPTIONAL DEBUG HELPER
-# ============================================================
-
-def debug_candidate_match(
-    claim: dict,
-    existing_claims: list[dict],
-) -> list[dict]:
-    """
-    Debug helper for development.
-
-    Returns detailed information about why each existing
-    claim did or did not become a candidate.
-
-    This does not affect normal pipeline behaviour.
-    """
-
-    results = []
-
-    for existing in existing_claims:
-
-        if claim.get("id") == existing.get("id"):
-            continue
-
-        subject_match = _same_subject(
-            claim.get("subject", ""),
-            existing.get("subject", ""),
-        )
-
-        predicate_match = _same_predicate(
-            claim.get("predicate", ""),
-            existing.get("predicate", ""),
-        )
-
-        value_type_match = _value_type_compatible(
-            claim,
-            existing,
-        )
-
-        unit_match = _unit_compatible(
-            claim,
-            existing,
-        )
-
-        period_match = _period_compatible(
-            claim,
-            existing,
-        )
-
-        definition_match = _definition_compatible(
-            claim,
-            existing,
-        )
-
-        candidate = (
-            subject_match
-            and predicate_match
-            and value_type_match
-            and unit_match
-            and period_match
-            and definition_match
-        )
-
-        results.append(
-            {
-                "existing_claim_id": existing.get("id"),
-                "existing_subject": existing.get("subject"),
-                "existing_predicate": existing.get("predicate"),
-                "subject_match": subject_match,
-                "predicate_match": predicate_match,
-                "value_type_match": value_type_match,
-                "unit_match": unit_match,
-                "period_match": period_match,
-                "definition_match": definition_match,
-                "candidate": candidate,
-            }
-        )
-
-    return results

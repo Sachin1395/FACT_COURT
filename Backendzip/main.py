@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.db.database import init_db, get_conn
-from app.pipeline import process_document
+from app.pipeline import process_documents_batch
 
 
 app = FastAPI(
@@ -260,17 +260,6 @@ async def upload_documents(
                 ),
             )
 
-        # ----------------------------------------------------
-        # Queue document processing
-        # ----------------------------------------------------
-
-        background_tasks.add_task(
-            process_document,
-            str(dest),
-            document_id,
-            session_id,
-        )
-
         uploaded.append(
             {
                 "document_id": document_id,
@@ -278,6 +267,34 @@ async def upload_documents(
                 "status": "processing",
             }
         )
+
+    # --------------------------------------------------------
+    # Queue ONE batch task for the entire upload request.
+    #
+    # Documents are processed sequentially inside the batch.
+    # Relationship generation happens only after all documents
+    # have been extracted, so cross-document comparisons do not
+    # depend on background-task completion order.
+    # --------------------------------------------------------
+
+    jobs = []
+
+    for item in uploaded:
+        jobs.append(
+            (
+                str(
+                    UPLOAD_DIR
+                    / f"{item['document_id']}.pdf"
+                ),
+                item["document_id"],
+                session_id,
+            )
+        )
+
+    background_tasks.add_task(
+        process_documents_batch,
+        jobs,
+    )
 
     return {
         "session_id": session_id,
