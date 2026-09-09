@@ -158,7 +158,7 @@ The UI exposes both claims, their source passages, and the reasoning behind the 
 
 For example, two merchandise trade-deficit claims can report different values because they cover different reporting periods. Fact Court identifies the context difference and returns `RECONCILES` rather than treating the values as a contradiction.
 
-![Fact Court reconciliation example](assets/fact-court-reconciliation.png)
+![Fact Court reconciliation example](assets/img1.png)
 
 *Example output: both claims and their source evidence are shown alongside the `RECONCILES` verdict and `DIFFERENT_PERIOD` reasoning.*
 
