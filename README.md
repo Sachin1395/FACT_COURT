@@ -387,7 +387,7 @@ The demo demonstrates:
 
 Each result exposes the claims and source evidence used to reach the verdict.
 
-**Video:** [VIDEO_LINK_HERE]
+**Video:** [https://drive.google.com/drive/folders/1jzx0fR84Qzik5VOVIhziLzRByvzs3Wt5]
 
 ---
 
