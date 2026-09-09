@@ -1,5 +1,25 @@
 # ⚖️ Fact Court
 
+## Table of Contents
+
+- [Approach](#approach)
+- [Architecture](#architecture)
+- [Handling the Open-Ended Parts](#handling-the-open-ended-parts)
+- [Example: Evidence-Backed Relationship](#example-evidence-backed-relationship)
+- [Deterministic Reasoning First](#4-deterministic-reasoning-first)
+- [Semantic Adjudication](#5-semantic-adjudication)
+- [Handling LLM Rate Limits](#handling-llm-rate-limits)
+- [Incremental Processing](#incremental-processing)
+- [Failure Handling](#failure-handling)
+- [Why These Four Relationships?](#why-these-four-relationships)
+- [Design Tradeoffs](#design-tradeoffs)
+- [Demo](#demo)
+- [Limitations](#limitations)
+- [Next Steps](#next-steps)
+- [Technology](#technology)
+- [Quick Start](#quick-start)
+- [Core Principle](#core-principle)
+
 ## Approach
 
 The assignment is intentionally open-ended, so the system was designed around four principles:
@@ -42,46 +62,46 @@ Relationships
                     │    FastAPI      │
                     └────────┬────────┘
                              │
-              ┌──────────────┴──────────────┐
-              ▼                             ▼
-      ┌───────────────┐             ┌───────────────┐
-      │ PDF Pipeline  │             │    SQLite     │
-      │               │             │               │
-      │ PyMuPDF       │             │ Documents     │
-      │ Evidence      │             │ Evidence      │
-      │ Blocks        │             │ Claims        │
-      └───────┬───────┘             │ Relationships │
-              │                     └───────────────┘
-              ▼
-      ┌───────────────┐
-      │ Gemini        │
-      │ Claim         │
-      │ Extraction    │
-      └───────┬───────┘
-              ▼
-      ┌───────────────┐
-      │ Verification  │
-      └───────┬───────┘
-              ▼
-      ┌───────────────┐
-      │ Candidate     │
-      │ Matching      │
-      └───────┬───────┘
-              ▼
-      ┌───────────────┐
-      │ Deterministic │
-      │ Rules         │
-      └───────┬───────┘
-              │
-       ambiguous pairs
-              │
-              ▼
-      ┌───────────────┐
-      │ Gemini        │
-      │ Adjudication  │
-      └───────┬───────┘
-              ▼
-       Relationship
+                ┌──────────────┴──────────────┐
+                ▼                             ▼
+        ┌───────────────┐             ┌───────────────┐
+        │ PDF Pipeline  │             │    SQLite     │
+        │               │             │               │
+        │ PyMuPDF       │             │ Documents     │
+        │ Evidence      │             │ Evidence      │
+        │ Blocks        │             │ Claims        │
+        └───────┬───────┘             │ Relationships │
+                │                     └───────────────┘
+                ▼
+        ┌───────────────┐
+        │ Gemini        │
+        │ Claim         │
+        │ Extraction    │
+        └───────┬───────┘
+                ▼
+        ┌───────────────┐
+        │ Verification  │
+        └───────┬───────┘
+                ▼
+        ┌───────────────┐
+        │ Candidate     │
+        │ Matching      │
+        └───────┬───────┘
+                ▼
+        ┌───────────────┐
+        │ Deterministic │
+        │ Rules         │
+        └───────┬───────┘
+                │
+         ambiguous pairs
+                │
+                ▼
+        ┌───────────────┐
+        │ Gemini        │
+        │ Adjudication  │
+        └───────┬───────┘
+                ▼
+         Relationship
 ```
 
 The architecture deliberately avoids unnecessary infrastructure. SQLite is sufficient for the prototype while keeping the complete evidence and relationship graph inspectable.
@@ -156,7 +176,7 @@ Unverified claims are retained so extraction failures remain inspectable rather 
 
 The UI exposes both claims, their source passages, and the reasoning behind the verdict.
 
-For example, two merchandise trade-deficit claims can report different values because they cover different reporting periods. Fact Court identifies the context difference and returns `RECONCILES` rather than treating the values as a contradiction.
+For example, two merchandise trade-deficit claims can report different values because they cover different reporting periods. Fact Court identifies the context difference and returns `RECONCILES`[...]
 
 ![Fact Court reconciliation example](assets/img1.png)
 
