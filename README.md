@@ -5,33 +5,12 @@
 Use this navigation map to jump to the section you need.
 
 | **🧭 Overview**                 | [Approach](#approach) · [Architecture](#architecture) · [Core Principle](#core-principle) · [Technology](#technology)                                                                                                                                                   |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| :------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **🧠 Reasoning & Adjudication** | [Deterministic Reasoning First](#4-deterministic-reasoning-first) · [Semantic Adjudication](#5-semantic-adjudication) · [Example: Evidence-Backed Relationship](#example-evidence-backed-relationship) · [Why These Four Relationships?](#why-these-four-relationships) |
 | **⚙️ Processing & Reliability** | [Handling the Open-Ended Parts](#handling-the-open-ended-parts) · [Handling LLM Rate Limits](#handling-llm-rate-limits) · [Incremental Processing](#incremental-processing) · [Failure Handling](#failure-handling)                                                     |
 | **🏗️ Design**                  | [Design Tradeoffs](#design-tradeoffs) · [Limitations](#limitations) · [Next Steps](#next-steps)                                                                                                                                                                         |
 | **🎥 Demo**                     | [Demo](#demo)                                                                                                                                                                                                                                                           |
 | **🚀 Getting Started**          | [Quick Start](#quick-start)                                                                                                                                                                                                                                             |
-
-
-## Table of Contents
-
-- [Approach](#approach)
-- [Architecture](#architecture)
-- [Handling the Open-Ended Parts](#handling-the-open-ended-parts)
-- [Example: Evidence-Backed Relationship](#example-evidence-backed-relationship)
-- [Deterministic Reasoning First](#4-deterministic-reasoning-first)
-- [Semantic Adjudication](#5-semantic-adjudication)
-- [Handling LLM Rate Limits](#handling-llm-rate-limits)
-- [Incremental Processing](#incremental-processing)
-- [Failure Handling](#failure-handling)
-- [Why These Four Relationships?](#why-these-four-relationships)
-- [Design Tradeoffs](#design-tradeoffs)
-- [Demo](#demo)
-- [Limitations](#limitations)
-- [Next Steps](#next-steps)
-- [Technology](#technology)
-- [Quick Start](#quick-start)
-- [Core Principle](#core-principle)
 
 ## Approach
 
