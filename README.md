@@ -16,7 +16,7 @@ Use this navigation map to jump to the section you need.
 
 ## Approach
 
-The assignment is intentionally open-ended, so the system was designed around four principles:
+The system was designed around four principles:
 
 **Ground first. Compare second. Use deterministic reasoning where possible. Use the LLM only where semantic judgment is actually needed.**
 
