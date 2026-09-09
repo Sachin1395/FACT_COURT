@@ -1,5 +1,7 @@
 # ⚖️ Fact Court
-(assets/IMG2.png)
+
+![Fact Court](assets/IMG2.png)
+
 ## Table of Contents
 
 Use this navigation map to jump to the section you need.
